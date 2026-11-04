@@ -1,0 +1,78 @@
+"""Keeping Matchmaker's data up to date with ECCentric.
+
+The feature store is a JSON-lines file, one record per circuit file: its key (`<run>/<circuit job id>`),
+size, modification time, feature version and features. Extraction only computes circuits that are new,
+changed or of an older feature version, so it can run after every ECCentric sweep update; a later record
+of the same key replaces an earlier one.
+"""
+import json
+import os
+import time
+from multiprocessing import Pool
+
+import stim
+
+from .features import FEATURE_VERSION, features_from_circuit
+
+
+def load_store(path: str) -> dict:
+    """{key: record} of a feature store, the last record of each key winning"""
+    records = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                if line.strip():
+                    r = json.loads(line)
+                    records[r["key"]] = r
+    return records
+
+
+def features_of_store(records: dict) -> dict:
+    """{key: features} of the store's current-version records that have features"""
+    return {k: r["features"] for k, r in records.items() if r.get("version") == FEATURE_VERSION and "features" in r}
+
+
+def _circuit_files(run_dirs, keys=None):
+    for run_dir in run_dirs:
+        run = os.path.basename(os.path.abspath(run_dir))
+        folder = os.path.join(run_dir, "circuits")
+        for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            if name.endswith(".stim") and (keys is None or f"{run}/{name[:-5]}" in keys):
+                yield f"{run}/{name[:-5]}", os.path.join(folder, name)
+
+
+def _extract(item):
+    key, path, stat = item
+    start = time.time()
+    try:
+        features = features_from_circuit(stim.Circuit.from_file(path))
+        return {"key": key, **stat, "version": FEATURE_VERSION, "seconds": round(time.time() - start, 3),
+                "features": features}
+    except Exception as e:
+        return {"key": key, **stat, "version": FEATURE_VERSION, "error": f"{type(e).__name__}: {str(e)[:300]}"}
+
+
+def extract(run_dirs, store_path: str, processes: int = 1, keys=None, log=print) -> dict:
+    """Add the features of new or changed circuit files of the run directories to the store; keys, if
+    given, limits extraction to those circuits. Returns counts"""
+    store = load_store(store_path)
+    todo = []
+    for key, path in _circuit_files(run_dirs, keys):
+        st = os.stat(path)
+        stat = {"size": st.st_size, "mtime": int(st.st_mtime)}
+        old = store.get(key)
+        if old and old.get("version") == FEATURE_VERSION and old.get("size") == stat["size"] and old.get("mtime") == stat["mtime"]:
+            continue
+        todo.append((key, path, stat))
+    # Big circuits first, so no straggler is left at the end
+    todo.sort(key=lambda t: -t[2]["size"])
+    done = failed = 0
+    with open(store_path, "a") as out, Pool(processes) as pool:
+        for record in pool.imap_unordered(_extract, todo, chunksize=1):
+            out.write(json.dumps(record) + "\n")
+            out.flush()
+            done += 1
+            failed += "error" in record
+            if done % 200 == 0:
+                log(f"  {done}/{len(todo)} circuits")
+    return {"known": len(store), "extracted": done, "failed": failed}
